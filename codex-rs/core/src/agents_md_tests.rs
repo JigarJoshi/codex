@@ -1,4 +1,6 @@
 use super::*;
+use crate::agents_md_manager::AgentsMdManager;
+use crate::agents_md_manager::SessionInstructions;
 use crate::config::ConfigBuilder;
 use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
@@ -28,6 +30,7 @@ use codex_exec_server::WriteFileOptions;
 use codex_extension_api::Instructions;
 use codex_features::Feature;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
@@ -721,6 +724,147 @@ async fn total_byte_limit_truncates_later_project_docs() {
     assert_eq!(loaded.text(), "root\n\nabc");
 }
 
+#[tokio::test]
+async fn strict_project_doc_budget_rejects_oversize_file() {
+    let repo = tempfile::tempdir().unwrap();
+    let path = repo.path().join("AGENTS.md");
+    fs::write(&path, "éabc").unwrap();
+    let mut config = make_config(&repo, /*limit*/ 4, /*instructions*/ None).await;
+    config.project_doc_overflow = ProjectDocOverflow::Error;
+    let environments = resolved_local_environments([("local", config.cwd.clone())]);
+
+    let mut warnings = Vec::new();
+    let error = load_project_instructions(&config, &environments, &mut warnings)
+        .await
+        .unwrap_err();
+    let CodexErrorDetails::InvalidRequest(message) = error.details() else {
+        panic!("expected project instruction overflow, got {error}");
+    };
+    assert_eq!(
+        *message,
+        format!(
+            "Project instructions at `{}` in environment `local` use at least 5 bytes, with 4 bytes left in the 4-byte `project_doc_max_bytes` budget. {PROJECT_DOC_BUDGET_GUIDANCE}",
+            path.display(),
+        )
+    );
+    assert!(warnings.is_empty());
+}
+
+#[tokio::test]
+async fn strict_project_doc_budget_is_shared_across_directories_and_environments() {
+    let primary = tempfile::tempdir().unwrap();
+    let secondary = tempfile::tempdir().unwrap();
+    let nested = primary.abs().join("nested");
+    fs::create_dir(&nested).unwrap();
+    fs::create_dir(primary.path().join(".git")).unwrap();
+    fs::write(primary.path().join("AGENTS.md"), "root").unwrap();
+    let nested_doc = nested.join("AGENTS.md");
+    let secondary_doc = secondary.path().join("AGENTS.md");
+    let mut config = make_config(&primary, /*limit*/ 8, /*instructions*/ None).await;
+    config.project_doc_overflow = ProjectDocOverflow::Error;
+    let environments =
+        resolved_local_environments([("primary", nested), ("secondary", secondary.abs())]);
+
+    fs::write(&nested_doc, "child").unwrap();
+    let error = load_project_instructions(&config, &environments, &mut Vec::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.details(), CodexErrorDetails::InvalidRequest(message)
+        if message.contains(&format!("`{}` in environment `primary`", nested_doc.display()))
+            && message.contains("with 4 bytes left"))
+    );
+
+    fs::write(&nested_doc, "tree").unwrap();
+    fs::write(&secondary_doc, "").unwrap();
+    let mut warnings = Vec::new();
+    let loaded = load_project_instructions(&config, &environments, &mut warnings)
+        .await
+        .unwrap();
+    assert_eq!(loaded.text(), "root\n\ntree");
+    assert!(warnings.is_empty());
+
+    fs::write(&secondary_doc, "extra").unwrap();
+    let error = load_project_instructions(&config, &environments, &mut Vec::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.details(), CodexErrorDetails::InvalidRequest(message)
+        if message.contains(&format!("`{}` in environment `secondary`", secondary_doc.display()))
+            && message.contains("with 0 bytes left"))
+    );
+
+    fs::write(primary.path().join("AGENTS.md"), "fullsize").unwrap();
+    let error = load_project_instructions(&config, &environments, &mut Vec::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.details(), CodexErrorDetails::InvalidRequest(message)
+        if message.contains(&format!("`{}` in environment `primary`", nested_doc.display()))
+            && message.contains("with 0 bytes left"))
+    );
+}
+
+#[tokio::test]
+async fn strict_project_doc_budget_invalidates_cached_truncated_instructions() {
+    let repo = tempfile::tempdir().unwrap();
+    let doc = repo.path().join("AGENTS.md");
+    fs::write(&doc, "oversize").unwrap();
+    let mut config = make_config(&repo, /*limit*/ 4, /*instructions*/ None).await;
+    let environments = resolved_local_environments([("local", config.cwd.clone())]);
+    let manager = AgentsMdManager::new(SessionInstructions::default());
+
+    let (loaded, warnings) = manager.refresh(&config, &environments).await;
+    assert_eq!(loaded.unwrap().unwrap().text(), "over");
+    assert_eq!(warnings.len(), 1);
+
+    config.project_doc_overflow = ProjectDocOverflow::Error;
+    assert!(
+        manager
+            .project_snapshot(&config, &environments)
+            .await
+            .is_none()
+    );
+    let (loaded, warnings) = manager.refresh(&config, &environments).await;
+    assert!(matches!(
+        loaded.unwrap_err().details(),
+        CodexErrorDetails::InvalidRequest(_)
+    ));
+    assert!(warnings.is_empty());
+    assert!(manager.get_loaded().await.is_none());
+
+    fs::write(&doc, "fits").unwrap();
+    let (loaded, warnings) = manager.refresh(&config, &environments).await;
+    assert_eq!(loaded.unwrap().unwrap().text(), "fits");
+    assert!(warnings.is_empty());
+}
+
+#[tokio::test]
+async fn strict_project_doc_budget_rechecks_changed_fallback_filenames() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(repo.path().join("RULES.md"), "oversize").unwrap();
+    let mut config = make_config(&repo, /*limit*/ 4, /*instructions*/ None).await;
+    config.project_doc_overflow = ProjectDocOverflow::Error;
+    let environments = resolved_local_environments([("local", config.cwd.clone())]);
+    let manager = AgentsMdManager::new(SessionInstructions::default());
+
+    assert!(
+        manager
+            .refresh(&config, &environments)
+            .await
+            .0
+            .unwrap()
+            .is_none()
+    );
+
+    config.project_doc_fallback_filenames = vec!["RULES.md".to_string()];
+    let error = manager.refresh(&config, &environments).await.0.unwrap_err();
+    assert!(
+        matches!(error.details(), CodexErrorDetails::InvalidRequest(message)
+        if message.contains("RULES.md"))
+    );
+}
+
 /// Unreadable ancestor markers must not hide readable instructions in the selected cwd.
 #[tokio::test]
 async fn read_agents_md_loads_cwd_instructions_when_parent_markers_are_unreadable() {
@@ -738,7 +882,7 @@ async fn read_agents_md_loads_cwd_instructions_when_parent_markers_are_unreadabl
     };
 
     let cwd = config.cwd.clone();
-    let loaded = read_agents_md(
+    let (loaded, _) = read_agents_md(
         &config.config,
         &fs,
         "local",
@@ -748,8 +892,7 @@ async fn read_agents_md_loads_cwd_instructions_when_parent_markers_are_unreadabl
         &mut Vec::new(),
     )
     .await
-    .expect("unreadable parent markers should not hide cwd instructions")
-    .expect("cwd instructions");
+    .expect("unreadable parent markers should not hide cwd instructions");
 
     assert_eq!(loaded.text(), "project doc");
 }
@@ -778,7 +921,9 @@ async fn read_agents_md_propagates_read_errors() {
     .await
     .expect_err("read error");
 
-    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert!(
+        matches!(err, ProjectDocError::Io(err) if err.kind() == io::ErrorKind::PermissionDenied)
+    );
 }
 
 #[tokio::test]
@@ -793,7 +938,7 @@ async fn read_agents_md_ignores_files_removed_after_discovery() {
     };
 
     let cwd = config.cwd.clone();
-    let loaded = read_agents_md(
+    let (loaded, _) = read_agents_md(
         &config.config,
         &fs,
         "local",
@@ -805,7 +950,7 @@ async fn read_agents_md_ignores_files_removed_after_discovery() {
     .await
     .expect("removed file is recoverable");
 
-    assert_eq!(loaded, None);
+    assert!(loaded.is_empty());
 }
 
 #[tokio::test]

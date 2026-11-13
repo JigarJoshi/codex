@@ -337,6 +337,7 @@ async fn new_config(
         mcp_optional_startup_grace: std::time::Duration::from_secs(1),
         model_providers,
         project_doc_max_bytes: 32 * 1024,
+        project_doc_overflow: Default::default(),
         project_doc_fallback_filenames: Vec::new(),
         tool_output_token_limit: None,
         agents_enabled: true,

@@ -6,6 +6,7 @@ use crate::agents_md::LoadedAgentsMd;
 use crate::agents_md::load_project_instructions;
 use crate::config::Config;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use codex_config::config_toml::ProjectDocOverflow;
 use codex_extension_api::Instructions;
 use codex_extension_api::ThreadInstructionsProvider;
 use codex_extension_api::UserInstructionsProvider;
@@ -45,8 +46,20 @@ struct AgentsMdState {
 struct AgentsMdCache {
     selections: Option<Vec<TurnEnvironmentSelection>>,
     project_doc_max_bytes: usize,
+    project_doc_overflow: ProjectDocOverflow,
+    project_doc_fallback_filenames: Vec<String>,
     active_project_trust_level: Option<TrustLevel>,
     loaded: Option<Arc<LoadedAgentsMd>>,
+}
+
+impl AgentsMdCache {
+    fn matches(&self, config: &Config, selections: &[TurnEnvironmentSelection]) -> bool {
+        self.selections.as_deref() == Some(selections)
+            && self.active_project_trust_level == config.active_project.trust_level
+            && self.project_doc_max_bytes == config.project_doc_max_bytes
+            && self.project_doc_overflow == config.project_doc_overflow
+            && self.project_doc_fallback_filenames == config.project_doc_fallback_filenames
+    }
 }
 
 impl AgentsMdManager {
@@ -84,12 +97,9 @@ impl AgentsMdManager {
             .turn_environments()
             .map(|environment| environment.selection.clone())
             .collect::<Vec<_>>();
-        let active_project_trust_level = config.active_project.trust_level;
         let (mut instructions, cached, refresh_repository) = {
             let mut state = self.state.lock().await;
-            let refresh_repository = state.cache.selections.as_ref() != Some(&selections)
-                || state.cache.active_project_trust_level != active_project_trust_level
-                || state.cache.project_doc_max_bytes != config.project_doc_max_bytes;
+            let refresh_repository = !state.cache.matches(config, &selections);
             if refresh_repository {
                 // Tightened read permissions must not leave inaccessible instructions visible,
                 // even if discovery fails or the caller cancels the refresh.
@@ -151,7 +161,9 @@ impl AgentsMdManager {
             state.cache = AgentsMdCache {
                 selections: Some(selections),
                 project_doc_max_bytes: budget,
-                active_project_trust_level,
+                project_doc_overflow: config.project_doc_overflow,
+                project_doc_fallback_filenames: config.project_doc_fallback_filenames.clone(),
+                active_project_trust_level: config.active_project.trust_level,
                 loaded: loaded.clone(),
             };
             Ok(loaded)
@@ -176,9 +188,9 @@ impl AgentsMdManager {
             .map(|environment| environment.selection.clone())
             .collect::<Vec<_>>();
         let state = self.state.lock().await;
-        (state.cache.selections.as_ref() == Some(&selections)
-            && state.cache.active_project_trust_level == config.active_project.trust_level
-            && state.cache.project_doc_max_bytes == config.project_doc_max_bytes)
+        state
+            .cache
+            .matches(config, &selections)
             .then(|| state.cache.loaded.clone().unwrap_or_default())
     }
 

@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::context::UserInstructions as ContextUserInstructions;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use codex_config::ConfigLayerSource;
+use codex_config::config_toml::ProjectDocOverflow;
 use codex_config::default_project_root_markers;
 use codex_config::merge_toml_values;
 use codex_config::project_root_markers_from_config;
@@ -31,6 +32,7 @@ use codex_extension_api::Instructions;
 use codex_file_system::FileSystemSandboxContext;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
+use codex_protocol::error::CodexErr;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
@@ -55,20 +57,37 @@ const PROJECT_DOC_BUDGET_GUIDANCE: &str = "Trim your project instructions to fit
 // transport when independent startup discovery runs concurrently.
 const MAX_CONCURRENT_ANCESTOR_PROBES: usize = 256;
 
+#[derive(Debug, thiserror::Error)]
+enum ProjectDocError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(
+        "Project instructions at `{path}` in environment `{environment_id}` use at least {minimum_size} bytes, with {remaining} bytes left in the {budget}-byte `project_doc_max_bytes` budget. {PROJECT_DOC_BUDGET_GUIDANCE}"
+    )]
+    Overflow {
+        path: String,
+        environment_id: String,
+        minimum_size: usize,
+        remaining: usize,
+        budget: usize,
+    },
+}
+
 /// Loads repository instructions across the selected environments.
 pub(crate) async fn load_project_instructions(
     config: &Config,
     environments: &TurnEnvironmentSnapshot,
     warnings: &mut Vec<String>,
-) -> io::Result<LoadedAgentsMd> {
+) -> Result<LoadedAgentsMd, CodexErr> {
     let mut loaded = LoadedAgentsMd::default();
-    if config.active_project.is_untrusted() || config.project_doc_max_bytes == 0 {
+    let strict = config.project_doc_overflow == ProjectDocOverflow::Error;
+    if config.active_project.is_untrusted() || (!strict && config.project_doc_max_bytes == 0) {
         return Ok(loaded);
     }
 
     let mut remaining = config.project_doc_max_bytes;
     for turn_environment in environments.turn_environments() {
-        if remaining == 0 {
+        if !strict && remaining == 0 {
             warnings.push(format!(
                 "The {}-byte project instruction budget was exhausted before checking environment `{}` or any later environments. {PROJECT_DOC_BUDGET_GUIDANCE}",
                 config.project_doc_max_bytes,
@@ -94,27 +113,35 @@ pub(crate) async fn load_project_instructions(
         )
         .await
         {
-            Ok(Some(docs)) => {
-                for entry in docs.entries {
-                    remaining = remaining.saturating_sub(entry.contents.len());
-                    loaded.entries.push(entry);
+            Ok((docs, remaining_bytes)) => {
+                if strict {
+                    remaining = remaining_bytes;
+                } else {
+                    // Legacy mode charges decoded text between environments.
+                    for entry in &docs.entries {
+                        remaining = remaining.saturating_sub(entry.contents.len());
+                    }
                 }
+                loaded.entries.extend(docs.entries);
             }
-            Ok(None) => {}
-            Err(error) if sandbox.is_none() => {
+            Err(error @ ProjectDocError::Overflow { .. }) => {
+                return Err(CodexErr::InvalidRequest(error.to_string()));
+            }
+            Err(ProjectDocError::Io(error)) if !strict && sandbox.is_none() => {
                 error!(
                     environment_id = turn_environment.selection.environment_id,
                     "error trying to find AGENTS.md docs: {error:#}"
                 );
             }
-            Err(error) => {
+            Err(ProjectDocError::Io(error)) => {
                 return Err(io::Error::new(
                     error.kind(),
                     format!(
                         "failed to load AGENTS.md instructions for environment `{}`: {error}",
                         turn_environment.selection.environment_id
                     ),
-                ));
+                )
+                .into());
             }
         }
     }
@@ -124,10 +151,7 @@ pub(crate) async fn load_project_instructions(
 
 /// Attempt to locate and load AGENTS.md documentation.
 ///
-/// On success returns `Ok(Some(loaded))` where `loaded` contains every
-/// discovered doc. If no documentation file is found the function returns
-/// `Ok(None)`. Unexpected I/O failures bubble up as `Err` so callers can
-/// decide how to handle them.
+/// Returns the loaded documents and remaining raw byte budget.
 #[tracing::instrument(name = "agents_md.load", skip_all, fields(max_total = max_total))]
 async fn read_agents_md(
     config: &Config,
@@ -137,13 +161,14 @@ async fn read_agents_md(
     max_total: usize,
     sandbox: Option<&FileSystemSandboxContext>,
     warnings: &mut Vec<String>,
-) -> io::Result<Option<LoadedAgentsMd>> {
+) -> Result<(LoadedAgentsMd, usize), ProjectDocError> {
     let paths = agents_md_paths(config, cwd, fs, sandbox).await?;
     let mut remaining = max_total;
     let mut loaded = LoadedAgentsMd::default();
+    let strict = config.project_doc_overflow == ProjectDocOverflow::Error;
 
     for p in paths {
-        if remaining == 0 {
+        if !strict && remaining == 0 {
             warnings.push(format!(
                 "Skipped project instructions in environment `{environment_id}` starting at `{}` because the {}-byte budget was exhausted. {PROJECT_DOC_BUDGET_GUIDANCE}",
                 p.inferred_native_path_string(),
@@ -152,9 +177,25 @@ async fn read_agents_md(
             break;
         }
 
-        let mut data = match fs.read_file(&p, ReadFileOptions::default(), sandbox).await {
+        let data = if strict {
+            read_project_doc_bounded(fs, &p, sandbox, remaining, |minimum_size| {
+                ProjectDocError::Overflow {
+                    path: p.inferred_native_path_string(),
+                    environment_id: environment_id.to_string(),
+                    minimum_size,
+                    remaining,
+                    budget: config.project_doc_max_bytes,
+                }
+            })
+            .await
+        } else {
+            fs.read_file(&p, ReadFileOptions::default(), sandbox)
+                .await
+                .map_err(ProjectDocError::Io)
+        };
+        let mut data = match data {
             Ok(data) => data,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(ProjectDocError::Io(err)) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
         };
         let size = data.len();
@@ -186,11 +227,27 @@ async fn read_agents_md(
         }
     }
 
-    if loaded.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(loaded))
+    Ok((loaded, remaining))
+}
+
+async fn read_project_doc_bounded(
+    fs: &dyn ExecutorFileSystem,
+    path: &PathUri,
+    sandbox: Option<&FileSystemSandboxContext>,
+    remaining: usize,
+    overflow: impl FnOnce(usize) -> ProjectDocError,
+) -> Result<Vec<u8>, ProjectDocError> {
+    let mut stream = fs.read_file_stream(path, sandbox).await?;
+    let mut data = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let size = data.len().saturating_add(chunk.len());
+        if size > remaining {
+            return Err(overflow(size));
+        }
+        data.extend_from_slice(&chunk);
     }
+    Ok(data)
 }
 
 /// Discovers AGENTS.md files from the project root to the current working

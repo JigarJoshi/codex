@@ -75,6 +75,14 @@ const RESERVED_MODEL_PROVIDER_IDS: [&str; 6] = [
 
 pub const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectDocOverflow {
+    #[default]
+    Truncate,
+    Error,
+}
+
 fn default_history() -> Option<History> {
     Some(History::default())
 }
@@ -335,6 +343,10 @@ pub struct ConfigToml {
     /// Maximum total bytes of project instruction content across all selected environments.
     #[serde(default = "default_project_doc_max_bytes")]
     pub project_doc_max_bytes: Option<usize>,
+
+    /// How to handle project instructions that exceed `project_doc_max_bytes`.
+    #[serde(default)]
+    pub project_doc_overflow: ProjectDocOverflow,
 
     /// Ordered list of fallback filenames to look for when AGENTS.md is missing.
     #[serde(default = "default_project_doc_fallback_filenames")]

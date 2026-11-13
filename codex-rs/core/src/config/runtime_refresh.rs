@@ -1,13 +1,17 @@
-//! Resolves refreshable MCP inputs and operational controls without rebuilding session configuration.
+//! Resolves refreshable settings without rebuilding session configuration.
 //! Existing sessions refresh ordinary MCP state without gaining enterprise authority.
 //! Validate the retained backend after applying the refreshable requirements.
 
+use crate::config::AGENTS_MD_MAX_BYTES;
 use crate::config::Config;
 use crate::config::ManagedFeatures;
 use crate::config::constrain_mcp_servers;
+use crate::config::normalize_project_doc_fallback_filenames;
 use crate::config::resolve_tool_suggest_config_from_layer_stack;
+use crate::config::validate_project_doc_budget;
 use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
+use codex_config::config_toml::ProjectDocOverflow;
 use codex_features::Feature;
 use codex_features::FeatureConfigSource;
 use codex_features::FeatureOverrides;
@@ -29,11 +33,14 @@ pub(crate) enum RuntimeConfigRefresh {
 
 #[derive(Default, Deserialize)]
 #[serde(default)]
-struct McpRefreshToml {
+struct RuntimeRefreshToml {
     features: Option<FeaturesToml>,
     plugins: codex_config::types::PluginsConfigToml,
     #[serde(rename = "apps")]
     _apps: Option<codex_config::types::AppsConfigToml>,
+    project_doc_max_bytes: Option<usize>,
+    project_doc_overflow: ProjectDocOverflow,
+    project_doc_fallback_filenames: Option<Vec<String>>,
 }
 
 impl Config {
@@ -73,7 +80,7 @@ impl Config {
         }
         // User refreshes retain the session's managed configuration.
         layers.ensure_config_server_applied()?;
-        let cfg: McpRefreshToml = layers
+        let cfg: RuntimeRefreshToml = layers
             .effective_config()
             .try_into()
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
@@ -209,6 +216,19 @@ impl Config {
             config.active_project = incoming.active_project.clone();
         }
         if !matches!(scope, RuntimeConfigRefresh::Mcp) {
+            // Apply strict mode and its discovery settings together. Legacy sessions keep
+            // their startup settings unless strict mode is enabled.
+            if self.project_doc_overflow == ProjectDocOverflow::Error
+                || cfg.project_doc_overflow == ProjectDocOverflow::Error
+            {
+                let project_doc_max_bytes =
+                    cfg.project_doc_max_bytes.unwrap_or(AGENTS_MD_MAX_BYTES);
+                validate_project_doc_budget(project_doc_max_bytes, cfg.project_doc_overflow)?;
+                config.project_doc_max_bytes = project_doc_max_bytes;
+                config.project_doc_overflow = cfg.project_doc_overflow;
+                config.project_doc_fallback_filenames =
+                    normalize_project_doc_fallback_filenames(cfg.project_doc_fallback_filenames);
+            }
             config.tool_suggest = resolve_tool_suggest_config_from_layer_stack(&layers);
         }
         config.config_layer_stack = layers

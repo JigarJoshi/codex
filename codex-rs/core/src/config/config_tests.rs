@@ -236,6 +236,37 @@ async fn load_config_normalizes_relative_cwd_override() -> std::io::Result<()> {
 }
 
 #[tokio::test]
+async fn strict_project_doc_overflow_requires_positive_budget() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let load = |config: &str| {
+        Config::load_from_base_config_with_overrides(
+            toml::from_str(config).unwrap(),
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+    };
+
+    let config = load("project_doc_max_bytes = 0").await?;
+    assert_eq!(config.project_doc_max_bytes, 0);
+    assert_eq!(config.project_doc_overflow, ProjectDocOverflow::Truncate);
+
+    let config = load("project_doc_overflow = 'error'").await?;
+    assert_eq!(config.project_doc_overflow, ProjectDocOverflow::Error);
+    assert_eq!(config.project_doc_max_bytes, AGENTS_MD_MAX_BYTES);
+
+    let error = load("project_doc_max_bytes = 0\nproject_doc_overflow = 'error'")
+        .await
+        .err()
+        .expect("zero-byte strict budget should fail");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "`project_doc_overflow = \"error\"` requires `project_doc_max_bytes` greater than zero"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_config_applies_optional_mcp_startup_grace() -> std::io::Result<()> {
     let codex_home = tempdir()?;
     let config_toml: ConfigToml = toml::from_str("mcp_optional_startup_grace_ms = 2500")

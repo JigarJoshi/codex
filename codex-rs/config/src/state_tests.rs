@@ -8,6 +8,78 @@ fn test_user_config_path(temp_dir: &TempDir, file_name: &str) -> AbsolutePathBuf
 }
 
 #[test]
+fn strict_project_instruction_settings_survive_project_layer_overrides() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let user = ConfigLayerEntry::new(
+        ConfigLayerSource::User {
+            file: test_user_config_path(&temp_dir, "config.toml"),
+            profile: None,
+        },
+        toml::from_str(
+            "project_doc_overflow = 'error'\nproject_doc_max_bytes = 8\n\
+             project_doc_fallback_filenames = ['RULES.md']",
+        )
+        .expect("user config"),
+    );
+    let project = ConfigLayerEntry::new(
+        ConfigLayerSource::Project {
+            dot_codex_folder: test_user_config_path(&temp_dir, ".codex"),
+        },
+        toml::from_str(
+            "project_doc_overflow = 'truncate'\nproject_doc_max_bytes = 99\n\
+             project_doc_fallback_filenames = []\nmodel = 'project-model'",
+        )
+        .expect("project config"),
+    );
+    let stack = ConfigLayerStack::new(
+        vec![user.clone(), project.clone()],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("valid config stack");
+    let effective = stack.effective_config();
+    let origins = stack.origins();
+    for key in [
+        "project_doc_overflow",
+        "project_doc_max_bytes",
+        "project_doc_fallback_filenames",
+    ] {
+        assert_eq!(effective.get(key), user.config.get(key));
+    }
+    assert_eq!(origins["project_doc_overflow"], user.metadata());
+    assert_eq!(origins["project_doc_max_bytes"], user.metadata());
+    assert_eq!(origins["project_doc_fallback_filenames.0"], user.metadata());
+    assert_eq!(effective.get("model"), project.config.get("model"));
+
+    let without_user = ConfigLayerStack::new(
+        vec![project.clone()],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("valid config stack");
+    assert_eq!(without_user.effective_config(), project.config);
+
+    let session = ConfigLayerEntry::new(
+        ConfigLayerSource::SessionFlags,
+        toml::from_str("project_doc_overflow = 'truncate'").expect("session config"),
+    );
+    let overridden = ConfigLayerStack::new(
+        vec![user, project, session.clone()],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("valid config stack");
+    assert_eq!(
+        overridden.effective_config()["project_doc_overflow"],
+        session.config["project_doc_overflow"]
+    );
+    assert_eq!(
+        overridden.origins()["project_doc_overflow"],
+        session.metadata()
+    );
+}
+
+#[test]
 fn origins_use_canonical_key_aliases() {
     let layer = ConfigLayerEntry::new(
         ConfigLayerSource::SessionFlags,

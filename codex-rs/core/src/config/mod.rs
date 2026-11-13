@@ -31,6 +31,7 @@ use codex_config::config_toml::CircuitBreakAction;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::DEFAULT_PROJECT_DOC_MAX_BYTES;
 use codex_config::config_toml::ProjectConfig;
+use codex_config::config_toml::ProjectDocOverflow;
 use codex_config::config_toml::RealtimeAudioConfig;
 use codex_config::config_toml::RealtimeConfig;
 use codex_config::config_toml::ThreadStoreToml;
@@ -266,9 +267,7 @@ impl Default for GhostSnapshotConfig {
     }
 }
 
-/// Maximum number of bytes of the documentation that will be embedded. Larger
-/// files are *silently truncated* to this size so we do not take up too much of
-/// the context window.
+/// Default shared byte budget for project instructions.
 pub(crate) const AGENTS_MD_MAX_BYTES: usize = DEFAULT_PROJECT_DOC_MAX_BYTES; // 32 KiB
 pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
 pub(crate) const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 4;
@@ -980,6 +979,9 @@ pub struct Config {
 
     /// Maximum total bytes of project instruction content across all selected environments.
     pub project_doc_max_bytes: usize,
+
+    /// How to handle project instructions that exceed the byte budget.
+    pub project_doc_overflow: ProjectDocOverflow,
 
     /// Additional filenames to try when looking for project-level docs.
     pub project_doc_fallback_filenames: Vec<String>,
@@ -3331,6 +3333,30 @@ fn validate_multi_agent_v2_tool_namespace(namespace: Option<&str>) -> std::io::R
     Ok(())
 }
 
+fn validate_project_doc_budget(
+    max_bytes: usize,
+    overflow: ProjectDocOverflow,
+) -> std::io::Result<()> {
+    if overflow == ProjectDocOverflow::Error && max_bytes == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "`project_doc_overflow = \"error\"` requires `project_doc_max_bytes` greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_project_doc_fallback_filenames(filenames: Option<Vec<String>>) -> Vec<String> {
+    filenames
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|name| {
+            let trimmed = name.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect()
+}
+
 impl Config {
     #[cfg(test)]
     async fn load_from_base_config_with_overrides(
@@ -3366,6 +3392,9 @@ impl Config {
                 "`experimental_thread_store_endpoint` is no longer supported; remove it from config.toml",
             ));
         }
+
+        let project_doc_max_bytes = cfg.project_doc_max_bytes.unwrap_or(AGENTS_MD_MAX_BYTES);
+        validate_project_doc_budget(project_doc_max_bytes, cfg.project_doc_overflow)?;
 
         validate_model_providers(&cfg.model_providers)
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
@@ -4644,20 +4673,11 @@ impl Config {
                 .map(Duration::from_millis)
                 .unwrap_or(DEFAULT_OPTIONAL_MCP_STARTUP_GRACE),
             model_providers,
-            project_doc_max_bytes: cfg.project_doc_max_bytes.unwrap_or(AGENTS_MD_MAX_BYTES),
-            project_doc_fallback_filenames: cfg
-                .project_doc_fallback_filenames
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|name| {
-                    let trimmed = name.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    }
-                })
-                .collect(),
+            project_doc_max_bytes,
+            project_doc_overflow: cfg.project_doc_overflow,
+            project_doc_fallback_filenames: normalize_project_doc_fallback_filenames(
+                cfg.project_doc_fallback_filenames,
+            ),
             tool_output_token_limit: cfg.tool_output_token_limit,
             agents_enabled,
             agent_max_threads,

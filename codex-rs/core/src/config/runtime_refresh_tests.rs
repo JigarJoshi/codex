@@ -19,6 +19,38 @@ async fn base_config() -> (tempfile::TempDir, Config) {
     (home, config)
 }
 
+#[test_case::test_case(RuntimeConfigRefresh::User; "user refresh")]
+#[test_case::test_case(RuntimeConfigRefresh::UserFiles; "file refresh")]
+#[tokio::test]
+async fn strict_project_doc_policy_refreshes_with_discovery_settings(scope: RuntimeConfigRefresh) {
+    let (_home, base) = base_config().await;
+    let mut incoming = base.clone();
+    incoming.config_layer_stack = incoming
+        .config_layer_stack
+        .with_user_config(
+            &incoming.codex_home.join(CONFIG_TOML_FILE),
+            toml::from_str(
+                "project_doc_max_bytes = 10\nproject_doc_overflow = 'error'\n\
+                 project_doc_fallback_filenames = [' RULES.md ', ' ']",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let refreshed = base.resolve_runtime_refresh(&incoming, scope).unwrap();
+    assert_eq!(refreshed.project_doc_overflow, ProjectDocOverflow::Error);
+    assert_eq!(refreshed.project_doc_max_bytes, 10);
+    assert_eq!(refreshed.project_doc_fallback_filenames, ["RULES.md"]);
+
+    let restored = refreshed.resolve_runtime_refresh(&base, scope).unwrap();
+    assert_eq!(restored.project_doc_overflow, ProjectDocOverflow::Truncate);
+    assert_eq!(restored.project_doc_max_bytes, base.project_doc_max_bytes);
+    assert_eq!(
+        restored.project_doc_fallback_filenames,
+        base.project_doc_fallback_filenames
+    );
+}
+
 async fn layered_config(
     base: &Config,
     user: &str,

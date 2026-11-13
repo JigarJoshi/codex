@@ -4308,6 +4308,13 @@
       },
       "type": "object"
     },
+    "ProjectDocOverflow": {
+      "enum": [
+        "truncate",
+        "error"
+      ],
+      "type": "string"
+    },
     "ProxySecretSource": {
       "description": "A credential source in the trusted proxy process, never in the executor environment.",
       "oneOf": [
@@ -8915,6 +8922,15 @@
       "format": "uint",
       "minimum": 0.0,
       "type": "integer"
+    },
+    "project_doc_overflow": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProjectDocOverflow"
+        }
+      ],
+      "default": "truncate",
+      "description": "How to handle project instructions that exceed `project_doc_max_bytes`."
     },
     "project_root_markers": {
       "default": null,

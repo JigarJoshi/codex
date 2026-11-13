@@ -16,6 +16,7 @@ use crate::shell_environment_policy::validate_shell_environment_policy_filter_co
 use crate::types::AppsConfigToml;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value as JsonValue;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -667,13 +668,43 @@ impl ConfigLayerStack {
     /// Selection and other requirements are applied when constructing the final config.
     pub fn effective_config(&self) -> TomlValue {
         let mut merged = TomlValue::Table(toml::map::Map::new());
-        for layer in self.layers_low_to_high() {
-            merge_toml_values(&mut merged, &layer.config);
+        for (_, config) in self.effective_layer_configs() {
+            merge_toml_values(&mut merged, &config);
         }
         if let Some(requirements) = &self.model_provider_requirements {
             crate::model_provider_requirements::apply(&mut merged, requirements);
         }
         merged
+    }
+
+    fn effective_layer_configs(
+        &self,
+    ) -> impl Iterator<Item = (&ConfigLayerEntry, Cow<'_, TomlValue>)> {
+        let strict_outside_project = self
+            .layers_high_to_low()
+            .filter(|layer| !matches!(layer.name, ConfigLayerSource::Project { .. }))
+            .find_map(|layer| layer.config.get("project_doc_overflow"))
+            .and_then(TomlValue::as_str)
+            == Some("error");
+        self.layers_low_to_high().map(move |layer| {
+            let mut config = Cow::Borrowed(&layer.config);
+            if strict_outside_project && matches!(layer.name, ConfigLayerSource::Project { .. }) {
+                // A project could also weaken strict mode by increasing the budget
+                // or changing which fallback files count as instructions.
+                for key in [
+                    "project_doc_overflow",
+                    "project_doc_max_bytes",
+                    "project_doc_fallback_filenames",
+                ] {
+                    if config.get(key).is_some()
+                        && let Some(table) = config.to_mut().as_table_mut()
+                    {
+                        table.remove(key);
+                    }
+                }
+            }
+            (layer, config)
+        })
     }
 
     /// Required provider selection used when building the effective configuration.
@@ -698,8 +729,8 @@ impl ConfigLayerStack {
         let mut path = Vec::new();
         let mut provider_paths = vec!["features.network_proxy.credentials.".to_string()];
 
-        for layer in self.layers_low_to_high() {
-            let config = normalize_key_aliases(&layer.config);
+        for (layer, config) in self.effective_layer_configs() {
+            let config = normalize_key_aliases(&config);
             if let Some(profiles) = config.get("profiles").and_then(TomlValue::as_table) {
                 provider_paths.extend(
                     profiles

@@ -12,6 +12,7 @@ pub use codex_config::ConfigLoadOptions;
 pub use codex_config::ConfigRequirements;
 pub use codex_config::ConfigRequirementsToml;
 pub use codex_config::config_toml::ProjectConfig;
+pub use codex_config::config_toml::ProjectDocOverflow;
 pub use codex_config::config_toml::RealtimeAudioConfig;
 pub use codex_config::config_toml::RealtimeConfig;
 pub use codex_config::types::AuthCredentialsStoreMode;
